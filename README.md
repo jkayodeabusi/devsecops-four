@@ -4,6 +4,8 @@
 
 The demo project for *Doing DevSecOps Engineering Across Leading CI/CD Workflow*. It's one small Java API (the Order Tracking API) with the same 8-stage secure pipeline on GitHub Actions, GitLab CI/CD, Azure DevOps and Jenkins. It deploys by signed digest to EKS, AKS, GKE or OKE, with no stored cloud keys.
 
+![DevSecOps demo flow tree](images/devsecops_demo_flow_tree.png)
+
 ## Layout
 
 | Path | What it is |

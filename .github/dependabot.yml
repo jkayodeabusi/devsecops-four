@@ -1,0 +1,28 @@
+# Keeps every pinned action SHA and every dependency current (DSO-01, DSO-04).
+# Dependabot proposes a PR that moves the SHA AND updates the "# vX.Y.Z"
+# comment beside it, so pins never go stale.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+  - package-ecosystem: maven
+    directory: /app-classic
+    schedule:
+      interval: weekly
+  - package-ecosystem: pip
+    directory: /app-ai
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /app-classic
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /app-ai
+    schedule:
+      interval: weekly

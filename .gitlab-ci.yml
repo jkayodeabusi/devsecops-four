@@ -1,0 +1,83 @@
+# =============================================================================
+#  DevSecOps demo - GitLab CI/CD, classic pipeline (Order Tracking API)
+#  Same 8 stages and DSO-01..15 controls as the other three platforms.
+#  Enforcement developers cannot remove lives in a separate security policy
+#  project: see platform-repos/gitlab-security-policies/.
+# =============================================================================
+
+include:
+  - local: ci/source.yml            # stage 2
+  - local: ci/classic.yml           # stages 3-7
+
+stages: [source, test, package, deploy, verify]
+
+# DSO-01: run pipelines for merge requests and the default branch only, and
+# never twice for the same commit (branch pipeline + MR pipeline).
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+  auto_cancel:
+    on_new_commit: interruptible    # a newer push cancels an older pipeline
+
+default:
+  interruptible: true
+  retry:
+    max: 1
+    when: [runner_system_failure, stuck_or_timeout_failure]   # never retry a failed gate
+
+# DSO-01: every image is pinned to an exact version. Run scripts/pin-digests.py
+# once to add the digest after each tag (image:tag@sha256:...).
+variables:
+  GITLEAKS_IMAGE: ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+  SEMGREP_IMAGE: semgrep/semgrep:1.185.0@sha256:67518c174185a2043fdbed16c70631b79209499b3671178e7194379b48295a0d
+  CHECKOV_IMAGE: bridgecrew/checkov:3.4.5@sha256:122602cf32cc72286155d39f1f234b7b594818f7b8d7fdf490701620e521368b
+  TRIVY_IMAGE: aquasec/trivy:0.76.2@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb
+  MAVEN_IMAGE: maven:3.9.9-eclipse-temurin-21@sha256:3a4ab3276a087bf276f79cae96b1af04f53731bec53fb2e651aca79e4b10211e
+  DOCKER_IMAGE: docker:27.5.1@sha256:aa3df78ecf320f5fafdce71c659f1629e96e9de0968305fe1de670e0ca9176ce
+  DIND_IMAGE: docker:27.5.1-dind@sha256:aa3df78ecf320f5fafdce71c659f1629e96e9de0968305fe1de670e0ca9176ce
+  ALPINE_IMAGE: alpine:3.21@sha256:bc21487101ae47172509130ee1092cc273a831968d64b617776d1f69c81e42ab
+  ZAP_IMAGE: ghcr.io/zaproxy/zaproxy:stable@sha256:9624669db72f54d86c4b46a7064518bd9bf79d8c61a4c31befa9923489f328af
+  # Your own pinned image with aws, az, gcloud, oci, kubectl, kubelogin and jq
+  # (build it from tools/cloud-cli/Dockerfile and push it to this project's registry).
+  CLOUD_CLI_IMAGE: $CI_REGISTRY_IMAGE/cloud-cli:1.0.0
+  COSIGN_VERSION: v3.1.4
+  TRIVY_NO_PROGRESS: "true"
+  TRIVY_CACHE_DIR: .trivycache/
+
+# --------------------------------------------------------------------------
+# Reusable rule sets (YAML anchors keep every job's trigger in one place)
+# --------------------------------------------------------------------------
+.no-schedule: &no-schedule
+  if: $CI_PIPELINE_SOURCE == "schedule"
+  when: never
+
+.rules-classic:
+  rules:
+    - *no-schedule
+    - changes: [app-classic/**/*, deploy/**/*, scripts/**/*, ci/classic.yml, ci/source.yml, .gitlab-ci.yml]
+
+.rules-classic-main:
+  rules:
+    - *no-schedule
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes: [app-classic/**/*, deploy/**/*, scripts/**/*, ci/classic.yml, ci/source.yml, .gitlab-ci.yml]
+
+.rules-any:
+  rules:
+    - *no-schedule
+    - when: on_success
+
+# Install cosign and refuse to run it unless its SHA-256 matches the release.
+# Used with `!reference [.cosign-install, script]` (works across included files).
+.cosign-install:
+  script:
+    - apk add --no-cache curl
+    - base="https://github.com/sigstore/cosign/releases/download/$COSIGN_VERSION"
+    - curl -sSfL -o /usr/local/bin/cosign "$base/cosign-linux-amd64"
+    - curl -sSfL -o cosign_checksums.txt "$base/cosign_checksums.txt"
+    - echo "$(grep ' cosign-linux-amd64$' cosign_checksums.txt | cut -d' ' -f1)  /usr/local/bin/cosign" | sha256sum -c -
+    - chmod +x /usr/local/bin/cosign

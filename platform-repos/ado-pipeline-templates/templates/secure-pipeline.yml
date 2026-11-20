@@ -1,0 +1,325 @@
+# =============================================================================
+#  DevSecOps demo - Azure DevOps: the SECURE EXTENDS TEMPLATE (classic lane)
+#  Lives in the security team's repo Security/pipeline-templates, tag v1.0.0.
+#  App pipelines `extends:` it and pass parameters; they never define stages.
+#  A "Required template" check on the production environment and on the
+#  service connections rejects any run that does not extend this file.
+#  Same 8 stages and DSO-01..15 controls as GitHub, GitLab and Jenkins.
+# =============================================================================
+
+parameters:
+  - name: appName                 # short name, used for the image repository
+    type: string
+  - name: appDir                  # folder with the app and its Dockerfile
+    type: string
+  - name: codeqlLanguages
+    type: string
+    default: java
+  - name: buildSteps              # the ONLY steps an app may contribute
+    type: stepList
+    default: []
+  - name: deployEnvironment       # an Environment with approvals and checks
+    type: string
+    default: production
+  - name: cloud                   # where production runs
+    type: string
+    default: azure
+    values: [aws, azure, gcp, oci]
+
+variables:
+  # DSO-01: scanner images pinned in the template, so a run cannot swap them.
+  # Run scripts/pin-digests.py to add @sha256 digests.
+  - name: GITLEAKS_IMAGE
+    value: ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+  - name: SEMGREP_IMAGE
+    value: semgrep/semgrep:1.185.0@sha256:67518c174185a2043fdbed16c70631b79209499b3671178e7194379b48295a0d
+  - name: TRIVY_IMAGE
+    value: aquasec/trivy:0.76.2@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb
+  - name: CHECKOV_IMAGE
+    value: bridgecrew/checkov:3.4.5@sha256:122602cf32cc72286155d39f1f234b7b594818f7b8d7fdf490701620e521368b
+  - name: ZAP_IMAGE
+    value: ghcr.io/zaproxy/zaproxy:stable@sha256:9624669db72f54d86c4b46a7064518bd9bf79d8c61a4c31befa9923489f328af
+  - name: NOTATION_VERSION
+    value: 1.3.2
+  - name: AKV_PLUGIN_VERSION
+    value: 1.2.1
+  - name: ORAS_VERSION
+    value: 1.3.6
+  - name: ACR
+    value: contosodevsecops.azurecr.io     # your registry
+  - name: IMAGE
+    value: $(ACR)/${{ parameters.appName }}
+  - name: SARIF_DIR
+    value: $(Build.ArtifactStagingDirectory)/sarif
+
+stages:
+  # ===========================================================================
+  #  STAGE 2 - SOURCE (DSO-02..05)
+  # ===========================================================================
+  - stage: Source
+    jobs:
+      - job: scanners
+        displayName: DSO-02..05 secrets, SAST, SCA, IaC
+        pool:
+          vmImage: ubuntu-24.04
+        steps:
+          - checkout: self
+            fetchDepth: 0                 # gitleaks needs history for the PR range
+            persistCredentials: false     # the job token is not left in .git/config
+
+          - script: |
+              set -euo pipefail
+              mkdir -p "$(SARIF_DIR)"
+              # PR builds (from the Build validation policy) scan only the PR's commits.
+              if [ -n "${SYSTEM_PULLREQUEST_TARGETBRANCH:-}" ]; then
+                git fetch --no-tags origin "${SYSTEM_PULLREQUEST_TARGETBRANCH#refs/heads/}"
+                RANGE="FETCH_HEAD..HEAD"
+              else
+                RANGE="HEAD~1..HEAD"
+              fi
+              docker run --rm -v "$PWD:/repo" -v "$(SARIF_DIR):/out" -w /repo "$(GITLEAKS_IMAGE)" \
+                git --log-opts="$RANGE" --redact --exit-code 1 \
+                --report-format sarif --report-path /out/gitleaks.sarif /repo
+            displayName: DSO-02 gitleaks (only this change's commits, redacted)
+
+          - script: |
+              docker run --rm -v "$PWD:/src" -v "$(SARIF_DIR):/out" -w /src "$(SEMGREP_IMAGE)" \
+                semgrep scan --config p/default --config p/owasp-top-ten \
+                --severity ERROR --error --sarif --output /out/semgrep.sarif
+            displayName: DSO-03 Semgrep (pinned rulesets, error severity gates)
+
+          - script: |
+              docker run --rm -v "$PWD:/src" -v "$(SARIF_DIR):/out" "$(TRIVY_IMAGE)" \
+                fs --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 \
+                --format sarif --output /out/trivy-fs.sarif /src/${{ parameters.appDir }}
+            displayName: DSO-04 Trivy fs (fixable High/Critical fail)
+
+          - script: |
+              docker run --rm -v "$PWD:/src" -v "$(SARIF_DIR):/out" -w /src "$(CHECKOV_IMAGE)" \
+                -d /src --framework dockerfile kubernetes terraform \
+                -o cli -o sarif --output-file-path console,/out
+            displayName: DSO-05 Checkov IaC
+
+          # AZURE-DEVOPS-ONLY: GitHub Advanced Security for Azure DevOps.
+          - task: AdvancedSecurity-Dependency-Scanning@1
+            displayName: DSO-04 Advanced Security dependency scanning
+
+          # All four tools' SARIF goes into the same Advanced Security alerts.
+          - task: AdvancedSecurity-Publish@1
+            displayName: Publish all SARIF to Advanced Security
+            condition: always()
+            inputs:
+              SarifsInputDirectory: $(SARIF_DIR)
+
+          # Defender for Cloud (DevOps security) reads SARIF from this artifact name.
+          - publish: $(SARIF_DIR)
+            artifact: CodeAnalysisLogs
+            condition: always()
+
+  # ===========================================================================
+  #  STAGE 3 - TEST (DSO-06)
+  # ===========================================================================
+  - stage: Test
+    dependsOn: Source
+    jobs:
+      - job: build_test
+        displayName: DSO-06 build, tests, CodeQL
+        pool:
+          vmImage: ubuntu-24.04
+        steps:
+          - checkout: self
+            persistCredentials: false
+          - task: AdvancedSecurity-Codeql-Init@1
+            inputs:
+              languages: ${{ parameters.codeqlLanguages }}
+              querysuite: security-extended
+          # AZURE-DEVOPS-ONLY: the app's build steps are filtered at compile
+          # time. Inline scripts are refused, so an app cannot smuggle an
+          # unreviewed `curl | sh` into the secure template.
+          - ${{ each step in parameters.buildSteps }}:
+              - ${{ each pair in step }}:
+                  ${{ if or(eq(pair.key, 'script'), eq(pair.key, 'bash'), eq(pair.key, 'pwsh'), eq(pair.key, 'powershell'), eq(pair.value, 'CmdLine@2'), eq(pair.value, 'Bash@3'), eq(pair.value, 'PowerShell@2')) }}:
+                    'Inline scripts are not allowed in buildSteps': error
+                  ${{ else }}:
+                    ${{ pair.key }}: ${{ pair.value }}
+          - task: AdvancedSecurity-Codeql-Analyze@1
+          - task: PublishTestResults@2
+            displayName: Test results to the Tests tab
+            condition: always()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: '**/TEST-*.xml'
+              failTaskOnFailedTests: true
+
+  # ===========================================================================
+  #  STAGE 4 - PACKAGE (DSO-07..10). Main branch only.
+  # ===========================================================================
+  - stage: Package
+    dependsOn: Test
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - job: package
+        displayName: DSO-07..10 build, scan, SBOM, sign
+        pool:
+          vmImage: ubuntu-24.04
+        steps:
+          - checkout: self
+            persistCredentials: false
+
+          - task: Docker@2
+            displayName: Log in to ACR (service connection uses workload identity)
+            inputs:
+              command: login
+              containerRegistry: acr-wif
+
+          - task: Docker@2
+            displayName: DSO-07 Build and push
+            inputs:
+              command: buildAndPush
+              containerRegistry: acr-wif
+              repository: ${{ parameters.appName }}
+              Dockerfile: ${{ parameters.appDir }}/Dockerfile
+              buildContext: ${{ parameters.appDir }}
+              tags: $(Build.BuildId)
+
+          - script: |
+              ref=$(docker inspect --format='{{index .RepoDigests 0}}' "$(IMAGE):$(Build.BuildId)")
+              echo "##vso[task.setvariable variable=IMAGE_REF;isOutput=true]$ref"
+              echo "##vso[task.setvariable variable=IMAGE_REF]$ref"
+              echo "From here on everything uses $ref, never a tag."
+            name: digest
+            displayName: DSO-07 Capture the immutable digest
+
+          - script: |
+              docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$(TRIVY_IMAGE)" \
+                image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$(IMAGE_REF)"
+            displayName: DSO-08 Trivy image scan
+
+          - script: |
+              docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD:/out" "$(TRIVY_IMAGE)" \
+                image --format cyclonedx --output /out/sbom.cdx.json "$(IMAGE_REF)"
+            displayName: DSO-09 CycloneDX SBOM
+
+          # AZURE-DEVOPS-ONLY: Notation (Notary Project) with the signing key in
+          # Azure Key Vault. Public Sigstore does not accept Azure DevOps OIDC
+          # tokens, so keyless Cosign is not available here.
+          - task: Notation@0
+            displayName: Install Notation
+            inputs:
+              command: install
+              version: $(NOTATION_VERSION)
+          - task: Notation@0
+            displayName: DSO-10 Sign the image (key stays in Key Vault)
+            inputs:
+              command: sign
+              artifactRefs: $(IMAGE_REF)
+              signatureFormat: cose
+              plugin: azureKeyVault
+              akvPluginVersion: $(AKV_PLUGIN_VERSION)
+              azurekvServiceConection: akv-signing       # sic: the task's input name
+              keyid: $(NOTATION_KEY_ID)
+
+          # The SBOM is attached to the image as an OCI referrer in ACR, then signed.
+          - script: |
+              set -euo pipefail
+              v="$(ORAS_VERSION)"
+              curl -sSLo oras.tgz "https://github.com/oras-project/oras/releases/download/v${v}/oras_${v}_linux_amd64.tar.gz"
+              curl -sSLo oras.sha "https://github.com/oras-project/oras/releases/download/v${v}/oras_${v}_checksums.txt"
+              grep " oras_${v}_linux_amd64.tar.gz$" oras.sha | sed 's/oras_.*/oras.tgz/' | sha256sum -c -
+              tar -xzf oras.tgz oras
+              refs=$(./oras attach --artifact-type application/vnd.cyclonedx+json \
+                --format go-template='{{.reference}}' "$(IMAGE_REF)" sbom.cdx.json)
+              echo "##vso[task.setvariable variable=BOM_REFS]$refs"
+            displayName: DSO-09 Attach the SBOM to the image (ORAS referrer)
+          - task: Notation@0
+            displayName: Sign the attached SBOM
+            inputs:
+              command: sign
+              artifactRefs: $(BOM_REFS)
+              signatureFormat: cose
+              plugin: azureKeyVault
+              akvPluginVersion: $(AKV_PLUGIN_VERSION)
+              azurekvServiceConection: akv-signing
+              keyid: $(NOTATION_KEY_ID)
+
+  # ===========================================================================
+  #  STAGES 5 + 6 - RELEASE GATE and DEPLOY (DSO-11..13)
+  #  AZURE-DEVOPS-ONLY: the gate is NOT in this YAML. The environment below
+  #  carries its checks: Approvals, Branch control (main), Required template
+  #  (this file, by tag), Exclusive lock, optional Business hours.
+  # ===========================================================================
+  - stage: Deploy
+    dependsOn: Package
+    variables:
+      - name: IMAGE_REF
+        value: $[ stageDependencies.Package.package.outputs['digest.IMAGE_REF'] ]
+      # Non-secret settings for the target cloud (cluster names, role ARN...).
+      # Link the group to Key Vault for OCI_EXCHANGE_CLIENT_SECRET.
+      - group: deploy-${{ parameters.cloud }}
+    jobs:
+      - deployment: deploy
+        displayName: DSO-11..13 verify, then deploy the digest
+        pool:
+          vmImage: ubuntu-24.04
+        environment: ${{ parameters.deployEnvironment }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self               # deployment jobs do not check out by default
+                  persistCredentials: false
+                - task: Docker@2
+                  inputs:
+                    command: login
+                    containerRegistry: acr-wif
+                - task: Notation@0
+                  inputs:
+                    command: install
+                    version: $(NOTATION_VERSION)
+                - task: Notation@0
+                  displayName: DSO-11 Refuse anything not signed with our Key Vault certificate
+                  inputs:
+                    command: verify
+                    artifactRefs: $(IMAGE_REF)
+                    trustPolicy: $(Build.SourcesDirectory)/azure-devops/notation/trustpolicy.json
+                    trustStore: $(Build.SourcesDirectory)/azure-devops/notation/truststore
+                - script: |
+                    case "${{ parameters.cloud }}" in
+                      azure) sudo az aks install-cli --only-show-errors >/dev/null ;;
+                      gcp)   sudo apt-get install -y -qq google-cloud-cli-gke-gcloud-auth-plugin ;;
+                      oci)   pipx install oci-cli==3.* ;;
+                    esac
+                  displayName: DSO-13 Install the CLI for the target cloud
+                - task: AzureCLI@2
+                  displayName: DSO-13 OIDC login and deploy the signed digest (no stored secret)
+                  inputs:
+                    # The service connection IS the identity. For Azure it logs in
+                    # directly; for AWS, GCP and OCI its $idToken is exchanged.
+                    azureSubscription: azure-wif-prod
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    addSpnToEnvironment: true          # exposes $idToken to the script
+                    inlineScript: ./scripts/deploy.sh "${{ parameters.cloud }}" "$(IMAGE_REF)"
+                  env:
+                    OCI_EXCHANGE_CLIENT_SECRET: $(OCI_EXCHANGE_CLIENT_SECRET)   # secrets must be mapped
+
+  # ===========================================================================
+  #  STAGE 7 - VERIFY: DAST against staging (DSO-14)
+  # ===========================================================================
+  - stage: Verify
+    dependsOn: Deploy
+    jobs:
+      - job: dast
+        displayName: DSO-14 OWASP ZAP baseline
+        pool:
+          vmImage: ubuntu-24.04
+        steps:
+          - checkout: none
+          - script: |
+              mkdir -p zap && chmod 777 zap
+              docker run --rm -v "$PWD/zap:/zap/wrk" "$(ZAP_IMAGE)" \
+                zap-baseline.py -t "$(STAGING_URL)" -r zap-report.html -J zap-report.json
+            displayName: ZAP baseline (warnings fail only if configured in rules)
+          - publish: zap
+            artifact: zap-report
+            condition: always()

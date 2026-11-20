@@ -1,0 +1,153 @@
+# =============================================================================
+#  Classic pipeline: test, package, release, deploy, verify
+#  App: ./app-classic (Java 21 + Maven), image: $CI_REGISTRY_IMAGE/classic
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# STAGE 3 - TEST (DSO-06)
+# ---------------------------------------------------------------------------
+classic:test:
+  stage: test
+  extends: .rules-classic
+  image: $MAVEN_IMAGE
+  variables:
+    MAVEN_OPTS: "-Dmaven.repo.local=$CI_PROJECT_DIR/.m2/repository"
+  cache:
+    key: maven-classic
+    paths: [.m2/repository/]
+  script:
+    # verify = compile + unit + integration tests, run once.
+    - mvn --batch-mode --no-transfer-progress -f app-classic/pom.xml verify
+  artifacts:
+    when: always
+    reports:
+      junit: app-classic/target/surefire-reports/TEST-*.xml
+
+# ---------------------------------------------------------------------------
+# STAGE 4 - PACKAGE (DSO-07..10) - default branch only
+# ---------------------------------------------------------------------------
+classic:build:
+  stage: package
+  extends: .rules-classic-main
+  image: $DOCKER_IMAGE
+  services:
+    - name: $DIND_IMAGE
+      alias: docker
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"    # TLS between the job and the dind service
+  needs: [secrets:gitleaks, sast:semgrep, sca:classic, iac:checkov, classic:test]
+  script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
+    # DSO-07: base image is pinned by digest inside app-classic/Dockerfile.
+    - docker build --pull -t "$CI_REGISTRY_IMAGE/classic:$CI_COMMIT_SHA" app-classic
+    - docker push "$CI_REGISTRY_IMAGE/classic:$CI_COMMIT_SHA"
+    # From here on every job uses IMAGE@DIGEST, never a tag.
+    - DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$CI_REGISTRY_IMAGE/classic:$CI_COMMIT_SHA" | cut -d@ -f2)
+    - echo "CLASSIC_REF=$CI_REGISTRY_IMAGE/classic@$DIGEST" >> build.env
+  artifacts:
+    reports:
+      dotenv: build.env             # hands CLASSIC_REF to later jobs
+
+classic:image-scan:
+  stage: package
+  extends: .rules-classic-main
+  image:
+    name: $TRIVY_IMAGE
+    entrypoint: [""]
+  needs: [classic:build]
+  variables:
+    TRIVY_USERNAME: $CI_REGISTRY_USER
+    TRIVY_PASSWORD: $CI_REGISTRY_PASSWORD
+    TRIVY_AUTH_URL: $CI_REGISTRY
+  script:
+    # DSO-08: scan the pushed digest; fail on fixable High/Critical.
+    - trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1
+        --format template --template "@/contrib/gitlab.tpl"
+        --output gl-container-scanning-report.json "$CLASSIC_REF"
+  artifacts:
+    when: always
+    reports:
+      container_scanning: gl-container-scanning-report.json
+
+classic:sbom:
+  stage: package
+  extends: .rules-classic-main
+  image:
+    name: $TRIVY_IMAGE
+    entrypoint: [""]
+  needs: [classic:build]
+  variables:
+    TRIVY_USERNAME: $CI_REGISTRY_USER
+    TRIVY_PASSWORD: $CI_REGISTRY_PASSWORD
+    TRIVY_AUTH_URL: $CI_REGISTRY
+  script:
+    # DSO-09: CycloneDX SBOM of the exact image that will ship.
+    - trivy image --format cyclonedx --output gl-sbom-classic.cdx.json "$CLASSIC_REF"
+  artifacts:
+    paths: [gl-sbom-classic.cdx.json]
+    reports:
+      cyclonedx: gl-sbom-classic.cdx.json
+
+classic:sign:
+  stage: package
+  extends: .rules-classic-main
+  image: $ALPINE_IMAGE
+  needs: [classic:build, classic:image-scan, classic:sbom]
+  id_tokens:
+    SIGSTORE_ID_TOKEN:              # keyless signing: no private key to store or leak
+      aud: sigstore
+  script:
+    - !reference [.cosign-install, script]
+    - cosign login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD"
+    # DSO-10: sign the digest and attach the SBOM as a signed attestation.
+    - cosign sign --yes "$CLASSIC_REF"
+    - cosign attest --yes --type cyclonedx --predicate gl-sbom-classic.cdx.json "$CLASSIC_REF"
+
+# ---------------------------------------------------------------------------
+# STAGES 5 + 6 - RELEASE GATE and DEPLOY (DSO-11..13)
+# `production` is a protected environment: only the release group can run
+# this job (Premium/Ultimate: add a deployment approval rule as well).
+# ---------------------------------------------------------------------------
+classic:deploy:
+  stage: deploy
+  extends: .rules-classic-main
+  image: $CLOUD_CLI_IMAGE
+  needs: [classic:build, classic:sign]
+  when: manual                      # DSO-12: one recorded human decision
+  allow_failure: false              # the pipeline waits here instead of passing
+  interruptible: false              # never cancel a deployment half-way
+  resource_group: production        # one deployment at a time
+  environment:
+    name: production
+    deployment_tier: production
+  id_tokens:
+    CLOUD_ID_TOKEN:                 # DSO-13: OIDC to the cloud, no stored keys
+      aud: $OIDC_AUDIENCE           # sts.amazonaws.com | api://AzureADTokenExchange | GCP/OCI provider
+  script:
+    # cosign, kubectl and the cloud CLIs are baked into the pinned cloud-cli image.
+    - cosign login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD"
+    # DSO-11: refuse any image this project's pipeline on the default branch did not sign.
+    - cosign verify "$CLASSIC_REF"
+        --certificate-identity "${CI_PROJECT_URL}//.gitlab-ci.yml@refs/heads/${CI_DEFAULT_BRANCH}"
+        --certificate-oidc-issuer "${CI_SERVER_URL}"
+    # DSO-13: the same script as GitHub, Azure DevOps and Jenkins.
+    # CLOUD and that cloud's variables are protected CI/CD variables on `production`.
+    - ./scripts/deploy.sh "$CLOUD" "$CLASSIC_REF"
+
+# ---------------------------------------------------------------------------
+# STAGE 7 - VERIFY: DAST against staging (DSO-14)
+# ---------------------------------------------------------------------------
+classic:dast:
+  stage: verify
+  extends: .rules-classic-main
+  image: $ZAP_IMAGE
+  needs: [classic:deploy]
+  script:
+    # Passive baseline scan; fails on rules configured as FAIL (-I ignores WARN).
+    - mkdir -p /zap/wrk
+    - zap-baseline.py -t "$STAGING_URL" -r zap-report.html -I || rc=$?
+    - cp /zap/wrk/zap-report.html "$CI_PROJECT_DIR/" || true
+    - exit ${rc:-0}
+  artifacts:
+    when: always
+    paths: [zap-report.html]

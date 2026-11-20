@@ -1,0 +1,43 @@
+# =============================================================================
+#  DevSecOps demo - Azure DevOps, classic pipeline (Order Tracking API)
+#
+#  This file has NO stages of its own. It extends the security team's
+#  template, pinned to a release tag, and supplies only the build steps.
+#  The production environment's "Required template" check rejects the run
+#  if this file stops extending that template.
+#
+#  Pull request builds: Azure Repos ignores the `pr:` keyword. Add the
+#  pipeline as a "Build validation" branch policy on main instead; that is
+#  what makes the Source and Test stages a merge gate.
+# =============================================================================
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [app-classic/*, deploy/*, scripts/*, azure-devops/*, azure-pipelines.yml]
+
+resources:
+  repositories:
+    - repository: templates
+      type: git
+      name: Security/pipeline-templates     # project/repo owned by the security team
+      ref: refs/tags/v1.0.0                 # DSO-01: pinned to a reviewed release
+
+extends:
+  template: templates/secure-pipeline.yml@templates
+  parameters:
+    appName: classic
+    appDir: app-classic
+    codeqlLanguages: java
+    deployEnvironment: production
+    cloud: azure                          # aws | azure | gcp | oci
+    buildSteps:
+      # Only tasks are accepted here; an inline script fails template expansion.
+      - task: Maven@4
+        displayName: DSO-06 mvn verify (unit + integration tests)
+        inputs:
+          mavenPomFile: app-classic/pom.xml
+          goals: verify
+          options: -B
+          publishJUnitResults: false        # the template publishes results itself

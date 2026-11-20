@@ -1,0 +1,145 @@
+# =============================================================================
+#  Jenkins Kubernetes agent pod for the DevSecOps stages (Kubernetes plugin).
+#  JENKINS-ONLY: every tool runs as its own pinned container in one throwaway
+#  pod, selected per step with container('<name>') { ... }.
+#  DSO-01: scripts/pin-digests.py adds @sha256 digests to every image.
+#
+#  Checkov scans this file too (DSO-05). The checks below do not fit a pod
+#  that lives for one build, so they are skipped with a reason, reviewed like code.
+# =============================================================================
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    purpose: devsecops-ci
+  annotations:
+    checkov.io/skip1: CKV_K8S_8=CI pod runs one build and exits; no service to probe
+    checkov.io/skip2: CKV_K8S_9=CI pod runs one build and exits; no service to probe
+    checkov.io/skip3: CKV_K8S_21=namespace is set by the Jenkins Kubernetes cloud
+    checkov.io/skip4: CKV_K8S_22=scanners and Maven write caches inside the container
+    checkov.io/skip5: CKV_K8S_40=UID 1000 matches the Jenkins agent workspace owner
+    checkov.io/skip6: CKV_K8S_43=cloud-cli image not built yet; remove after make pin
+spec:
+  automountServiceAccountToken: false     # the build never talks to this cluster's API
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: gitleaks
+      image: ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+      imagePullPolicy: Always
+      command: ["sleep"]                   # override ENTRYPOINT so Jenkins can exec steps
+      args: ["infinity"]
+      resources:
+        limits: {cpu: "1", memory: 1Gi}
+        requests: {cpu: 100m, memory: 256Mi}
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+    - name: semgrep
+      image: semgrep/semgrep:1.185.0@sha256:67518c174185a2043fdbed16c70631b79209499b3671178e7194379b48295a0d
+      imagePullPolicy: Always
+      command: ["sleep"]                   # override ENTRYPOINT so Jenkins can exec steps
+      args: ["infinity"]
+      resources:
+        limits: {cpu: "1", memory: 1Gi}
+        requests: {cpu: 100m, memory: 256Mi}
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+    - name: trivy
+      image: aquasec/trivy:0.76.2@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb
+      imagePullPolicy: Always
+      command: ["sleep"]                   # override ENTRYPOINT so Jenkins can exec steps
+      args: ["infinity"]
+      resources:
+        limits: {cpu: "1", memory: 1Gi}
+        requests: {cpu: 100m, memory: 256Mi}
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+    - name: checkov
+      image: bridgecrew/checkov:3.4.5@sha256:122602cf32cc72286155d39f1f234b7b594818f7b8d7fdf490701620e521368b
+      imagePullPolicy: Always
+      command: ["sleep"]                   # override ENTRYPOINT so Jenkins can exec steps
+      args: ["infinity"]
+      resources:
+        limits: {cpu: "1", memory: 1Gi}
+        requests: {cpu: 100m, memory: 256Mi}
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+    - name: maven
+      image: maven:3.9.9-eclipse-temurin-21@sha256:3a4ab3276a087bf276f79cae96b1af04f53731bec53fb2e651aca79e4b10211e
+      imagePullPolicy: Always
+      command: ["sleep"]                   # override ENTRYPOINT so Jenkins can exec steps
+      args: ["infinity"]
+      resources:
+        limits: {cpu: "2", memory: 4Gi}
+        requests: {cpu: 500m, memory: 1Gi}
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+    - name: buildkit
+      image: moby/buildkit:v0.35.0-rootless@sha256:5987568f92dafbfb679879de59c1cd8d26597f5f6635c314e166164e2615870c
+      imagePullPolicy: Always
+      command: ["sleep"]                   # override ENTRYPOINT so Jenkins can exec steps
+      args: ["infinity"]
+      env:
+        - name: BUILDKITD_FLAGS
+          value: --oci-worker-no-process-sandbox
+      resources:
+        limits: {cpu: "2", memory: 4Gi}
+        requests: {cpu: 500m, memory: 1Gi}
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+        seccompProfile:
+          type: Unconfined                 # required by rootless BuildKit
+        appArmorProfile:
+          type: Unconfined
+    - name: cosign
+      image: ghcr.io/sigstore/cosign/cosign:v3.1.4@sha256:0f06154836d2de34f887a5c273506d52ca43edaa1d9e53e6510fa78a48f69c2d
+      imagePullPolicy: Always
+      command: ["sleep"]                   # override ENTRYPOINT so Jenkins can exec steps
+      args: ["infinity"]
+      resources:
+        limits: {cpu: "1", memory: 1Gi}
+        requests: {cpu: 100m, memory: 256Mi}
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+    - name: cloud
+      image: registry.example.com/platform/cloud-cli:1.0.0
+      imagePullPolicy: Always
+      command: ["sleep"]                   # override ENTRYPOINT so Jenkins can exec steps
+      args: ["infinity"]
+      resources:
+        limits: {cpu: "1", memory: 1Gi}
+        requests: {cpu: 100m, memory: 256Mi}
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+    - name: zap
+      image: ghcr.io/zaproxy/zaproxy:stable@sha256:9624669db72f54d86c4b46a7064518bd9bf79d8c61a4c31befa9923489f328af
+      imagePullPolicy: Always
+      command: ["sleep"]                   # override ENTRYPOINT so Jenkins can exec steps
+      args: ["infinity"]
+      resources:
+        limits: {cpu: "1", memory: 1Gi}
+        requests: {cpu: 100m, memory: 256Mi}
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]

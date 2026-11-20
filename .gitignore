@@ -1,0 +1,10 @@
+# Build output and local scan results (never commit them)
+app-classic/target/
+sbom.cdx.json
+*.sarif
+reports/
+zap/
+# Local secrets and cloud logins
+.env
+*.pem
+.oci/

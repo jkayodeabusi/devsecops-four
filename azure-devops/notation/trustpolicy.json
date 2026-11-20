@@ -1,0 +1,19 @@
+{
+  "version": "1.0",
+  "trustPolicies": [
+    {
+      "name": "devsecops-images",
+      "registryScopes": [
+        "contosodevsecops.azurecr.io/classic",
+        "contosodevsecops.azurecr.io/ai"
+      ],
+      "signatureVerification": {
+        "level": "strict"
+      },
+      "trustStores": ["ca:devsecops"],
+      "trustedIdentities": [
+        "x509.subject: CN=devsecops-signing,O=Contoso,C=CA"
+      ]
+    }
+  ]
+}

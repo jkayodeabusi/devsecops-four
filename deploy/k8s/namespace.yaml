@@ -1,0 +1,10 @@
+# The app lives in its own namespace, so its RBAC, network policy and the
+# pipeline's deploy permission can all be scoped to "app" only.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: app
+  labels:
+    # Kubernetes Pod Security Admission: reject any pod that is not "restricted".
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest

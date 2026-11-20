@@ -1,0 +1,20 @@
+# Jenkins plugins used by the DevSecOps pipelines.
+# DSO-01: install with jenkins-plugin-cli --plugin-file plugins.txt, then freeze
+# the exact versions your controller passed testing as id:version lines.
+# Keep oidc-provider newer than 96.vee8ed882ec4d (CVE-2025-47884).
+configuration-as-code
+workflow-aggregator
+pipeline-model-definition
+pipeline-utility-steps
+kubernetes
+git
+credentials-binding
+oidc-provider
+warnings-ng
+junit
+lockable-resources
+pipeline-milestone-step
+matrix-auth
+audit-trail
+prometheus
+timestamper

@@ -1,0 +1,37 @@
+# =============================================================================
+#  Jenkins Configuration as Code (JCasC) - controller hardening for the series
+#  JENKINS-ONLY: on the other three platforms the vendor runs the control
+#  plane. Here it is yours: this file is the reviewed, version-controlled
+#  source of truth for the controller. Apply with the configuration-as-code plugin.
+# =============================================================================
+jenkins:
+  systemMessage: "DevSecOps controller - configured as code; manual changes are overwritten."
+  numExecutors: 0                 # never run builds on the controller
+  disableRememberMe: true
+  markupFormatter: plainText      # no HTML in job descriptions
+  crumbIssuer: standard           # CSRF protection
+  remotingSecurity:
+    enabled: true                 # agents cannot command the controller
+  # Authentication and authorisation: plug in your IdP (OIDC/SAML) and use
+  # folder-scoped roles, so only release-approvers / ai-risk-owners can
+  # submit the input steps in the production folders.
+
+unclassified:
+  location:
+    url: https://jenkins.example.com/   # also the OIDC issuer base: https://jenkins.example.com/oidc
+  globalLibraries:
+    libraries:
+      - name: devsecops-lib
+        defaultVersion: v1.4.0
+        allowVersionOverride: false     # Jenkinsfiles cannot request another branch or tag
+        implicit: false
+        includeInChangesets: false
+        retriever:
+          modernSCM:
+            scm:
+              git:
+                remote: https://git.example.com/security/jenkins-devsecops-lib.git
+
+security:
+  gitHostKeyVerificationConfiguration:
+    sshHostKeyVerificationStrategy: knownHostsFileVerificationStrategy

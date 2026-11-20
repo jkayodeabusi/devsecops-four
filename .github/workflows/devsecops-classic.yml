@@ -1,0 +1,367 @@
+# =============================================================================
+#  DevSecOps demo - GitHub Actions, classic pipeline (Order Tracking API)
+#  Same 8 stages and DSO-01..15 controls as the GitLab, Azure DevOps and
+#  Jenkins pipelines in this repo. GitHub-only features are marked GITHUB-ONLY.
+#  The deploy job calls scripts/deploy.sh, the same script every platform uses.
+# =============================================================================
+
+name: devsecops-classic
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ["app-classic/**", "deploy/**", "scripts/**", ".github/workflows/devsecops-classic.yml"]
+  push:
+    branches: [main]
+    paths: ["app-classic/**", "deploy/**", "scripts/**", ".github/workflows/devsecops-classic.yml"]
+
+# DSO-01: the default token can only read the repo. Each job below asks for
+# exactly the extra permission it needs, and nothing more.
+permissions:
+  contents: read
+
+# One run per branch; a newer push cancels an older run that is still going.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APP_DIR: app-classic
+  IMAGE: ghcr.io/${{ github.repository }}/classic
+  TRIVY_VERSION: v0.76.2
+  GITLEAKS_VERSION: 8.30.1
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # STAGE 2 - SOURCE: secrets (DSO-02)
+  # Runs first and fastest: a leaked key is the most urgent finding there is.
+  # ---------------------------------------------------------------------------
+  secrets:
+    name: DSO-02 Secret scanning
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history so gitleaks can read the PR's commits)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false   # do not leave the token in .git/config
+
+      - name: Install gitleaks and verify its checksum
+        # Download the release binary and refuse to run it unless the SHA-256
+        # matches the checksum file published with the same release.
+        run: |
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL -o "$tarball" "$base/$tarball"
+          curl -sSfL -o checksums.txt "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          grep " $tarball\$" checksums.txt | sha256sum --check --strict
+          tar -xzf "$tarball" gitleaks && sudo mv gitleaks /usr/local/bin/
+
+      - name: Scan only the commits this change adds
+        # On a PR: scan base..head. On main: scan the pushed commits.
+        # --redact keeps the secret value out of the job log.
+        env:
+          RANGE: ${{ github.event_name == 'pull_request' && format('{0}..{1}', github.event.pull_request.base.sha, github.event.pull_request.head.sha) || format('{0}..{1}', github.event.before, github.sha) }}
+        run: |
+          gitleaks git --log-opts="$RANGE" --redact --exit-code 1 \
+            --report-format sarif --report-path gitleaks.sarif .
+
+      - name: Upload findings to the Security tab (even when the scan failed)
+        if: always()
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
+
+  # ---------------------------------------------------------------------------
+  # STAGE 2 - SOURCE: SAST (DSO-03) with CodeQL v4
+  # CodeQL v3 is deprecated in December 2026; v4 runs on Node.js 24.
+  # ---------------------------------------------------------------------------
+  sast:
+    name: DSO-03 SAST (CodeQL)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write   # only this job may write code-scanning alerts
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL for Java
+        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          languages: java-kotlin
+          build-mode: none                     # analyse source without a build
+          queries: security-extended           # broader security query suite
+
+      - name: Analyze and upload results
+        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          category: codeql-java
+        # Gate: make "Code scanning results / CodeQL" a required status check
+        # in the branch ruleset, with the alert threshold set to High.
+
+  # ---------------------------------------------------------------------------
+  # STAGE 2 - SOURCE: SCA (DSO-04)
+  # Dependabot keeps dependencies updated in the background; this step is the
+  # in-pipeline gate that stops a PR from ADDING a vulnerable dependency.
+  # ---------------------------------------------------------------------------
+  sca:
+    name: DSO-04 Dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write     # lets the action post its summary on the PR
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Block new High/Critical vulnerabilities and disallowed licenses
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+          deny-licenses: AGPL-3.0-only, GPL-3.0-only
+          comment-summary-in-pr: on-failure
+
+  # ---------------------------------------------------------------------------
+  # STAGE 2 - SOURCE: IaC and Dockerfile misconfiguration (DSO-05)
+  # ---------------------------------------------------------------------------
+  iac:
+    name: DSO-05 IaC scan (Trivy config)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Scan Dockerfile, Kubernetes manifests and Terraform
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}   # pin the scanner, not just the action
+          scan-type: config
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          exit-code: "1"                       # without this the gate never fails
+          format: sarif
+          output: trivy-config.sarif
+      - name: Upload IaC findings
+        if: always()
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: trivy-config.sarif
+          category: trivy-config
+
+  # ---------------------------------------------------------------------------
+  # STAGE 3 - TEST (DSO-06)
+  # ---------------------------------------------------------------------------
+  test:
+    name: DSO-06 Unit and integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up JDK 21 with a Maven dependency cache
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Run tests once with Maven (verify = compile + test + integration)
+        working-directory: ${{ env.APP_DIR }}
+        run: mvn --batch-mode --no-transfer-progress verify
+      - name: Keep JUnit reports as evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: junit-classic
+          path: ${{ env.APP_DIR }}/target/surefire-reports/*.xml
+
+  # ---------------------------------------------------------------------------
+  # STAGE 4 - PACKAGE: build, scan, SBOM, sign, attest (DSO-07..10)
+  # Runs only after every Source and Test gate is green.
+  # ---------------------------------------------------------------------------
+  package:
+    name: DSO-07..10 Build, scan, SBOM, sign
+    needs: [secrets, sast, iac, test]
+    if: github.event_name == 'push'          # PRs never publish images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write          # push the image to GHCR
+      id-token: write          # keyless signing: Sigstore issues a short-lived cert from this OIDC token
+      security-events: write
+      attestations: write      # GITHUB-ONLY: store build provenance as a GitHub artifact attestation
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: DSO-07 Build the image (base image pinned by digest in the Dockerfile)
+        run: docker build -t "$IMAGE:${{ github.sha }}" "$APP_DIR"
+
+      - name: DSO-07 Push and capture the immutable digest
+        id: push
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "$IMAGE:${{ github.sha }}"
+          digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE:${{ github.sha }}" | cut -d@ -f2)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          # From here on, everything refers to IMAGE@DIGEST, never to a tag.
+
+      - name: DSO-08 Scan the pushed image (fail on fixable High/Critical)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          image-ref: ${{ env.IMAGE }}@${{ steps.push.outputs.digest }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true      # gate on what a team can actually fix today
+          exit-code: "1"
+          format: sarif
+          output: trivy-image.sarif
+
+      - name: Upload image findings
+        if: always()
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+      - name: DSO-09 Generate a CycloneDX SBOM of the image
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ${{ env.IMAGE }}@${{ steps.push.outputs.digest }}
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+
+      - name: DSO-10 Sign the image and attach the SBOM as a signed attestation
+        # Keyless: no private key to store or leak. The signature records this
+        # workflow's identity, which the deploy job verifies below.
+        env:
+          REF: ${{ env.IMAGE }}@${{ steps.push.outputs.digest }}
+        run: |
+          cosign sign --yes "$REF"
+          cosign attest --yes --type cyclonedx --predicate sbom.cdx.json "$REF"
+
+      # GITHUB-ONLY: built-in artifact attestations. One action writes SLSA build
+      # provenance (who built it, from which commit and workflow), signs it with
+      # the same keyless Sigstore flow, and stores it with the repository. Anyone
+      # can check it later with: gh attestation verify oci://IMAGE@DIGEST -R OWNER/REPO
+      - name: DSO-10 Build provenance (GitHub artifact attestation)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+  # ---------------------------------------------------------------------------
+  # STAGES 5 + 6 - RELEASE GATE and DEPLOY (DSO-11..13)
+  # The "production" environment has required reviewers configured in repo
+  # settings: the job pauses here until a named approver says yes (DSO-12).
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: DSO-11..13 Approve, verify, deploy
+    needs: package
+    runs-on: ubuntu-latest
+    environment: production        # DSO-12: one recorded human approval
+    permissions:
+      contents: read
+      id-token: write              # DSO-13: OIDC login to the cloud, no stored keys
+      attestations: read           # gh attestation verify
+      packages: read
+    env:
+      # Image reference by digest, handed over from the package job.
+      # (Repository names in GHCR must be lowercase.)
+      REF: ${{ format('ghcr.io/{0}/classic@{1}', github.repository, needs.package.outputs.digest) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+
+      - name: DSO-11 Refuse anything this workflow did not sign
+        run: |
+          cosign verify "$REF" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity "https://github.com/${{ github.repository }}/.github/workflows/devsecops-classic.yml@refs/heads/main"
+
+      - name: DSO-11 Check build provenance with the GitHub CLI (GitHub-only)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify "oci://$REF" -R "${{ github.repository }}" \
+            --signer-workflow "${{ github.repository }}/.github/workflows/devsecops-classic.yml"
+
+      - name: DSO-13 Install the CLI for the target cloud
+        # ubuntu-latest already has aws, az, gcloud, kubectl and jq.
+        env:
+          CLOUD: ${{ vars.CLOUD }}
+        run: |
+          case "$CLOUD" in
+            azure) sudo az aks install-cli --only-show-errors >/dev/null ;;        # adds kubelogin
+            gcp)   sudo apt-get install -y -qq google-cloud-cli-gke-gcloud-auth-plugin ;;
+            oci)   pipx install oci-cli==3.* ;;
+          esac
+
+      - name: DSO-13 Log in with OIDC and deploy the signed digest
+        # scripts/ci-jwt.sh reads this job's OIDC token (id-token: write above),
+        # scripts/cloud-login.sh swaps it for short-lived cloud credentials,
+        # scripts/deploy.sh applies deploy/k8s with $REF and waits for the rollout.
+        # Set CLOUD and the variables for that cloud under Settings > Variables.
+        env:
+          CLOUD: ${{ vars.CLOUD }}                       # aws | azure | gcp | oci
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          EKS_CLUSTER: ${{ vars.EKS_CLUSTER }}
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          AKS_RESOURCE_GROUP: ${{ vars.AKS_RESOURCE_GROUP }}
+          AKS_CLUSTER: ${{ vars.AKS_CLUSTER }}
+          GCP_WIF_AUDIENCE: ${{ vars.GCP_WIF_AUDIENCE }}
+          GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GKE_CLUSTER: ${{ vars.GKE_CLUSTER }}
+          GKE_LOCATION: ${{ vars.GKE_LOCATION }}
+          OCI_JWT_AUDIENCE: ${{ vars.OCI_JWT_AUDIENCE }}
+          OCI_DOMAIN_URL: ${{ vars.OCI_DOMAIN_URL }}
+          OCI_EXCHANGE_CLIENT_ID: ${{ vars.OCI_EXCHANGE_CLIENT_ID }}
+          OCI_EXCHANGE_CLIENT_SECRET: ${{ secrets.OCI_EXCHANGE_CLIENT_SECRET }}   # environment secret
+          OCI_TENANCY_OCID: ${{ vars.OCI_TENANCY_OCID }}
+          OCI_REGION: ${{ vars.OCI_REGION }}
+          OKE_CLUSTER_OCID: ${{ vars.OKE_CLUSTER_OCID }}
+        run: ./scripts/deploy.sh "$CLOUD" "$REF"
+
+  # ---------------------------------------------------------------------------
+  # STAGE 7 - VERIFY: DAST against staging (DSO-14)
+  # ---------------------------------------------------------------------------
+  dast:
+    name: DSO-14 DAST (OWASP ZAP baseline)
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Passive ZAP scan of the running staging app
+        # Fails on rules configured as FAIL; -I keeps WARN-level alerts from
+        # failing the job. Pin the ZAP image by digest before recording.
+        run: |
+          docker run --rm -v "$PWD:/zap/wrk:rw" ghcr.io/zaproxy/zaproxy:stable@sha256:9624669db72f54d86c4b46a7064518bd9bf79d8c61a4c31befa9923489f328af \
+            zap-baseline.py -t "${{ vars.STAGING_URL }}" -r zap-report.html -I
+      - name: Keep the DAST report as evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: zap-report
+          path: zap-report.html

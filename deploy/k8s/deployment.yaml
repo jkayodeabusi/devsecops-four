@@ -1,0 +1,71 @@
+# Order Tracking API deployment, hardened to the "restricted" pod standard.
+# The image below is a placeholder digest. scripts/deploy.sh replaces it with
+# the signed IMAGE@DIGEST from the pipeline; a tag is never deployed (DSO-13).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: classic
+  namespace: app
+  labels:
+    app: classic
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app: classic
+  template:
+    metadata:
+      labels:
+        app: classic
+    spec:
+      serviceAccountName: classic
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532                  # distroless "nonroot"
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: app
+          image: registry.example.com/devsecops/classic@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: PORT
+              value: "8080"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 192Mi
+            limits:
+              cpu: 500m
+              memory: 384Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          volumeMounts:
+            - name: tmp                   # the JVM needs a writable /tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi

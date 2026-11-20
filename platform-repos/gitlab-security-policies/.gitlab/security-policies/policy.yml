@@ -1,0 +1,82 @@
+# =============================================================================
+#  GITLAB-ONLY: security policies (Ultimate)
+#  This file lives in a SEPARATE "security policy project" owned by the
+#  security team, linked to the application group under Secure > Policies.
+#  Developers in the application projects cannot edit or delete these rules,
+#  even though they own .gitlab-ci.yml. That is the key difference from
+#  GitHub Actions, where the workflow author owns every job.
+# =============================================================================
+
+# 1. Pipeline execution policy: inject jobs every pipeline must run.
+#    The jobs come from pipeline/enforced-security.yml in this policy project
+#    and run in the reserved .pipeline-policy-pre stage, before project jobs.
+pipeline_execution_policy:
+  - name: Enforce secret scan and AI red team
+    description: Every pipeline in the group runs gitleaks; AI projects also run the PR red-team set.
+    enabled: true
+    pipeline_config_strategy: inject_policy
+    content:
+      include:
+        - project: security/devsecops-policies
+          file: pipeline/enforced-security.yml
+          ref: v1.0.0                    # pin the policy CI file to a release tag
+    policy_scope:
+      projects:
+        including: []                    # empty = every project the policy project is linked to
+
+# 2. Merge request approval policy: block the merge until the security team
+#    approves any NEW Critical or High finding from these scanners.
+approval_policy:
+  - name: Security approval for new Critical or High findings
+    description: Newly detected Critical/High findings need a security approver.
+    enabled: true
+    rules:
+      - type: scan_finding
+        branch_type: protected
+        scanners: [secret_detection, sast, dependency_scanning, container_scanning]
+        vulnerabilities_allowed: 0
+        severity_levels: [critical, high]
+        vulnerability_states: [newly_detected]
+    actions:
+      - type: require_approval
+        approvals_required: 1
+        group_approvers: [security/appsec-reviewers]
+    approval_settings:
+      block_branch_modification: true    # nobody can unprotect the branch to dodge the rule
+      prevent_pushing_and_force_pushing: true
+      prevent_approval_by_author: true
+      prevent_approval_by_commit_author: true
+
+  - name: AI risk owner approves AI changes
+    description: Any MR to the default branch of an AI project needs the AI risk group.
+    enabled: true
+    rules:
+      - type: any_merge_request
+        branch_type: default
+        commits: any
+    actions:
+      - type: require_approval
+        approvals_required: 1
+        group_approvers: [security/ai-risk-owners]
+    policy_scope:
+      projects:
+        including:
+          - id: 1234                     # replace with the AI project IDs
+
+# 3. Scan execution policy: GitLab's own scanners run on every MR pipeline and
+#    on a nightly schedule, whatever the project's .gitlab-ci.yml says.
+scan_execution_policy:
+  - name: Built-in scanners on every MR and nightly
+    description: Secret detection, SAST and dependency scanning, plus a nightly container scan.
+    enabled: true
+    rules:
+      - type: pipeline
+        branch_type: all
+      - type: schedule
+        branch_type: default
+        cadence: "17 6 * * *"
+    actions:
+      - scan: secret_detection
+      - scan: sast
+      - scan: dependency_scanning
+      - scan: container_scanning

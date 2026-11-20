@@ -1,0 +1,109 @@
+# =============================================================================
+#  STAGE 2 - SOURCE (DSO-02..05)
+#  Each scanner image sets its tool as ENTRYPOINT. GitLab runs `script:` in a
+#  shell, so every scanner job resets it with `entrypoint: [""]`. Without that
+#  the job fails before it scans anything (the "entrypoint trap").
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# DSO-02 Secret scanning (gitleaks)
+# ---------------------------------------------------------------------------
+secrets:gitleaks:
+  stage: source
+  extends: .rules-any
+  image:
+    name: $GITLEAKS_IMAGE
+    entrypoint: [""]
+  variables:
+    GIT_DEPTH: "0"                  # full history, so the commit range exists
+  script:
+    - git config --global --add safe.directory "$CI_PROJECT_DIR"
+    - mkdir -p reports
+    # MR: scan only the commits the MR adds. Default branch: the pushed commits.
+    - |
+      if [ -n "$CI_MERGE_REQUEST_DIFF_BASE_SHA" ]; then
+        RANGE="$CI_MERGE_REQUEST_DIFF_BASE_SHA..$CI_COMMIT_SHA"
+      elif [ "$CI_COMMIT_BEFORE_SHA" != "0000000000000000000000000000000000000000" ]; then
+        RANGE="$CI_COMMIT_BEFORE_SHA..$CI_COMMIT_SHA"
+      else
+        RANGE="-1"
+      fi
+      echo "Scanning commits: $RANGE"
+    # --redact keeps the secret out of the job log; exit 1 on any finding.
+    - gitleaks git --log-opts="$RANGE" --redact --exit-code 1
+        --report-format junit --report-path reports/gitleaks.xml .
+  artifacts:
+    when: always
+    paths: [reports/]
+    reports:
+      junit: reports/gitleaks.xml   # findings appear in the MR test summary
+
+# ---------------------------------------------------------------------------
+# DSO-03 SAST (Semgrep, pinned rulesets, GitLab SAST report)
+# ---------------------------------------------------------------------------
+sast:semgrep:
+  stage: source
+  extends: .rules-any
+  image:
+    name: $SEMGREP_IMAGE
+    entrypoint: [""]
+  variables:
+    SEMGREP_SEND_METRICS: "off"
+  script:
+    # Pinned rulesets, never `--config auto`, so results do not drift.
+    - semgrep scan --config p/default --config p/owasp-top-ten
+        --error --severity ERROR
+        --gitlab-sast-output=gl-sast-semgrep.json
+        app-classic
+  artifacts:
+    when: always
+    reports:
+      sast: gl-sast-semgrep.json    # findings appear in the MR security widget
+
+# ---------------------------------------------------------------------------
+# DSO-04 SCA (Trivy filesystem scan of each app's dependencies)
+# ---------------------------------------------------------------------------
+.sca-trivy:
+  stage: source
+  image:
+    name: $TRIVY_IMAGE
+    entrypoint: [""]
+  cache:
+    key: trivy-db
+    paths: [.trivycache/]
+  script:
+    - mkdir -p reports
+    # Fail on fixable High/Critical; the JUnit template feeds the MR test summary.
+    - trivy fs --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1
+        --format template --template "@/contrib/junit.tpl"
+        --output "reports/sca-${APP}.xml" "$APP"
+  artifacts:
+    when: always
+    reports:
+      junit: reports/sca-*.xml
+
+sca:classic:
+  extends: [.sca-trivy, .rules-classic]
+  variables:
+    APP: app-classic
+
+# ---------------------------------------------------------------------------
+# DSO-05 IaC and Dockerfile misconfiguration (Checkov)
+# ---------------------------------------------------------------------------
+iac:checkov:
+  stage: source
+  extends: .rules-any
+  image:
+    name: $CHECKOV_IMAGE
+    entrypoint: [""]
+  script:
+    # Console output for the log + a GitLab SAST report for the MR widget.
+    # Any failed check fails the job; justified exceptions use inline
+    # `checkov:skip=<ID>:<reason>` comments, reviewed like code.
+    - checkov --directory . --framework dockerfile kubernetes terraform
+        --output cli --output gitlab_sast --output-file-path console,reports
+  artifacts:
+    when: always
+    paths: [reports/]
+    reports:
+      sast: reports/results_gitlab_sast.json

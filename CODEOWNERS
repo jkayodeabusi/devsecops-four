@@ -1,0 +1,12 @@
+# Changes to the delivery path need a security review (DSO-01).
+# GitHub and GitLab both read this file; on Azure DevOps use a branch policy
+# with required reviewers on the same paths. Replace the team names with yours.
+/.github/            @your-org/security-team
+/.gitlab-ci.yml      @your-org/security-team
+/ci/                 @your-org/security-team
+/azure-pipelines.yml @your-org/security-team
+/azure-devops/       @your-org/security-team
+/Jenkinsfile         @your-org/security-team
+/jenkins/            @your-org/security-team
+/scripts/            @your-org/security-team
+/deploy/             @your-org/platform-team @your-org/security-team

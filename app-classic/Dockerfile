@@ -17,7 +17,7 @@ COPY src ./src
 RUN mvn -B -q --no-transfer-progress -DskipTests package
 
 # ---- Stage 2: runtime -------------------------------------------------------
-FROM cgr.dev/chainguard/jre:latest@sha256:8bc14490d877809958a50abb74b860c50bfe12939007621f3937158f26843c06
+FROM cgr.dev/chainguard/jre:latest@sha256:1173cd7ad3db14b6755d6d86daf7118abedff96d6efd95b9f4d7793a4d38ec9a
 WORKDIR /app
 COPY --from=build /src/target/order-tracking.jar /app/order-tracking.jar
 # UID 65532 ("nonroot") comes with the base image; never run as root.
